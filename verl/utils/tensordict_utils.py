@@ -492,7 +492,18 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
+                try:
+                    tensor_lst = tensor.unbind()  # for performance
+                except RuntimeError:
+                    # TransferQueue reassembly can build [B, j, ...] nested tensors whose
+                    # ragged axis is the component axis (e.g. mRoPE position_ids). Recover
+                    # the per-sample tensors from the values buffer in that case.
+                    values = tensor.values()
+                    offsets = tensor.offsets()
+                    if int(offsets[-1]) != values.shape[0]:
+                        raise
+                    offsets = offsets.tolist()
+                    tensor_lst = [values[offsets[j] : offsets[j + 1]] for j in range(len(offsets) - 1)]
                 selected_tensors = [tensor_lst[idx] for idx in indices]
                 data_dict[key] = nested_tensor_from_tensor_list(
                     selected_tensors, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)
