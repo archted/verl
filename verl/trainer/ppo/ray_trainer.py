@@ -1402,6 +1402,54 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
+    def _check_zero_variance_reward(self, metrics: dict):
+        """Abort the run when the rollout reward distribution collapses to a constant.
+
+        E-1 failure mode: once the policy collapses, every sample in the batch
+        receives the same reward, advantages become all-zero, gradients vanish
+        and the run burns GPU-hours producing nothing. ``critic/score/min ==
+        critic/score/max`` detects exactly that state.
+
+        Abort after ``VERL_ZERO_VAR_ABORT_STEPS`` consecutive zero-variance
+        steps (env knob, default 5, 0 disables the check). The raise lets the
+        launcher/watchdog restart from the last healthy checkpoint instead of
+        idling for the remaining ETA.
+        """
+        try:
+            max_steps = int(os.getenv("VERL_ZERO_VAR_ABORT_STEPS", "5"))
+        except ValueError:
+            max_steps = 5
+        if max_steps <= 0:
+            return
+
+        score_min = metrics.get("critic/score/min")
+        score_max = metrics.get("critic/score/max")
+        if score_min is None or score_max is None:
+            return
+
+        if float(score_min) == float(score_max):
+            self._zero_var_steps = getattr(self, "_zero_var_steps", 0) + 1
+            score_mean = metrics.get("critic/score/mean")
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                f"Zero reward variance detected for {self._zero_var_steps}/{max_steps} consecutive step(s): "
+                f"score min==max=={score_min}, mean={score_mean}. Policy collapse risk (E-1 pattern)."
+            )
+            if self._zero_var_steps >= max_steps:
+                raise RuntimeError(
+                    f"VERL zero-variance circuit breaker: reward distribution has been constant "
+                    f"(min==max=={score_min}) for {self._zero_var_steps} consecutive steps. "
+                    f"The policy has likely collapsed (see Wiki E-1); aborting to save GPU time. "
+                    f"Set VERL_ZERO_VAR_ABORT_STEPS=0 to disable this check."
+                )
+        else:
+            if getattr(self, "_zero_var_steps", 0) > 0:
+                import logging as _logging
+
+                _logging.getLogger(__name__).info("Reward variance recovered; zero-variance counter reset.")
+            self._zero_var_steps = 0
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1770,6 +1818,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                self._check_zero_variance_reward(metrics)
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
